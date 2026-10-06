@@ -1,0 +1,561 @@
+# -*- coding: utf-8 -*-
+"""网易云点歌 —— 引用一条含网易云链接的消息 + @南汐，就把那首歌下载发到群里。
+
+## 为什么自己写（2026-10-06 调研过现成的）
+社区里点歌插件不少，但**清一色走「第三方 API + key/cookie」路线**：
+  · `Aoi-Karlin/astrbot_plugin_netease_music_pro_max` —— 要自建 NeteaseCloudMusicApi + 导入 Cookies
+  · `Dayanshifu/astrbot_plugin_music_pro`            —— 要注册第三方 API key（柠柚）+ 公开音源站
+  · `ApproLight01/astrbot_netease_mus`               —— 只把 id 解析成文本发出来，不下载
+而本插件走**官方直链**：``http://music.163.com/song/media/outer/url?id=<歌曲ID>.mp3``
+**零依赖、免 key、免登录**，不会因为第三方服务挂掉而失效。
+代价：拿不到 VIP / 版权受限的歌（那些只能靠登录态 + 别的接口）。
+
+## 实测出来的坑（都踩过，别再踩）
+1. **必须带浏览器 User-Agent**：aiohttp/urllib 的默认 UA 会被网易云拒掉，
+   返回 83 字节 JSON ``{"code":-460,"message":"检测到您的网络环境存在风险…"}``；
+   带 UA 才是 3.5 MB 的 audio/mpeg。
+2. **HTTP 200 完全不可信**：
+   · 歌不存在/下架 → 200 + ``text/html`` 的 404 页面（~104 KB）
+   · UA 不对       → 200 + ``application/json`` 的 -460 错误（83 字节）
+   ⇒ 必须**三个判据一起卡**：Content-Type 是 ``audio/*``、
+     最终 URL 落到了 ``music.126.net`` CDN、体积够大。
+3. **短链要先跟随重定向**：群友分享的多半是 ``https://163cn.tv/xxxx``，它本身不含 id；
+   302 之后才是 ``y.music.163.com/m/song?id=xxx``。
+4. **被引用的消息在 ``Reply`` 段里，而且 ``Reply.text`` 直接是被引用消息的全文**
+   （实测 dump：``Reply{text:"https://163cn.tv/bhu1nHlF", qq:"…", chain:[Plain{…}]}``），
+   不用去遍历 chain。
+5. **`async def` 处理器里「多次 `yield` + 中间干活」是行不通的** —— AstrBot 在
+   `stop_event()` 之后**不再往下迭代生成器**，于是「收到喵」发出去了、后面的下载代码
+   **一行没跑**（日志里连一条 `[netease]` 都没有，最坑的是它**不报错**）。
+   petpet 那种「stop + 只 yield 一次」才是安全形态。
+   ⇒ 中间反馈一律用 ``await event.send(MessageChain([...]))`` 主动发，**最后只 yield 一次**。
+6. **AstrBot 的 `File`（群文件）组件在「AstrBot 在宿主机、OneBot 在容器」的架构下必然失败。**
+   它的 ``file`` 是个 property，会在 **AstrBot 本机** ``os.path.exists()`` 检查：
+   容器内路径在宿主机不存在 ⇒ 返回空串 ⇒ 发出去的是 ``{'type':'file','data':{'file':''}}``
+   ⇒ ``retcode=1400 message segment "file" is missing required or usable fields``。
+   **发群文件只能用 OneBot 的 ``upload_group_file``**（读容器内路径，所以要 ``docker cp``）。
+7. **`Record` 是安全的**：适配器对 ``Image | Record`` 走的是
+   ``convert_to_base64()`` → ``file: "base64://…"``，**与两边文件系统无关**，
+   传宿主机路径即可。实测一首 229 秒 / 3.5 MB 的歌当语音发出去没被平台拒。
+
+## 触发方式（两种，2026-10-06 都实测过）
+1. **引用**一条含网易云链接的消息 + ``@南汐`` —— 消息可以是纯文本分享，也可以是
+   QQ 的**音乐卡片**（``com.tencent.music.lua``），卡片里歌名/歌手/id 都能挖出来。
+2. **直接 @**：``@南汐 https://music.163.com/song?id=3413072220&…`` —— 不用引用，
+   链接就在本条消息里。（`event.message_str` 是 AstrBot 摘掉 At 段之后的纯文本。）
+
+取链接的优先级是「**先看被引用的那条，没有可用的再看本条**」——
+引用了别的消息时以被引用的为准，避免本条正文里的无关链接插队。
+群聊必须 @（`event.is_at_or_wake_command` 把关），所以链接单纯发在群里不会被理。
+带一层**每群冷却**（`COOLDOWN_SECONDS`）防刷屏。
+"""
+
+import asyncio
+import json
+import re
+import time
+from html import unescape
+from pathlib import Path
+
+import aiohttp
+
+from astrbot.api import logger, star
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event.filter import EventMessageType
+from astrbot.api.message_components import Json, Plain, Record, Reply
+from astrbot.core.star.star_tools import StarTools
+
+#: 浏览器 UA —— **不能省**，见模块 docstring 的坑 1。
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+#: 从一段文本里抠出所有 http(s) 链接（网易云分享文本里长这样：
+#: `分享XXX的单曲《YYY》: https://163cn.tv/zzz (来自@网易云音乐)`）。
+LINK_RE = re.compile(r"https?://[^\s\"'<>()（）【】]+")
+#: 歌曲 id：`?id=123` / `&id=123`
+ID_RE = re.compile(r"[?&]id=(\d+)")
+#: 短链域名（本身不含 id，必须跟随重定向）
+SHORT_HOSTS = ("163cn.tv",)
+#: 认可的网易云域名（避免去解析无关链接）
+NETEASE_HOSTS = (
+    "music.163.com",
+    "y.music.163.com",
+    "163cn.tv",
+    "music.126.net",
+)
+#: 下载地址模板 —— 主人给的、也是官方那个"外链播放"接口。
+OUTER_URL = "http://music.163.com/song/media/outer/url?id={sid}.mp3"
+
+#: 音频体积下限：比这还小的一律当失败（真歌至少几百 KB；错误页 ~104 KB）。
+MIN_AUDIO_BYTES = 200 * 1024
+#: 下载超时（秒）
+DOWNLOAD_TIMEOUT = 90
+#: 每群冷却（秒），防刷屏
+COOLDOWN_SECONDS = 20
+
+
+def _find_music_meta(node, depth: int = 0):
+    """在卡片 JSON 里**递归**找出 ``meta.music`` 那个 dict。
+
+    为什么不写死路径：AstrBot 的 ``Json`` 组件给的 ``seg.data`` 到底是
+    ``{"data": "<JSON 字符串>"}`` 还是整个消息段、再套几层，**随 QQ / 适配器版本变**
+    （本机实测就不是一层）。所以按"哪一层有 music 就取哪一层"来找，
+    顺带把**字符串形式的嵌套 JSON** 也解开 —— 网易云卡片正是这么嵌的。
+
+    Args:
+        node: 待搜索的 JSON 节点（dict / list / 字符串）。
+        depth: 递归深度，防止畸形数据把栈撑爆。
+
+    Returns:
+        dict | None: 形似音乐元信息的 dict（含 ``title`` 或 ``jumpUrl``），找不到则 None。
+    """
+    if depth > 6:
+        return None
+    if isinstance(node, str):
+        text = node.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            return _find_music_meta(json.loads(text), depth + 1)
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(node, dict):
+        music = node.get("music")
+        if isinstance(music, dict) and ("title" in music or "jumpUrl" in music):
+            return music
+        for value in node.values():
+            found = _find_music_meta(value, depth + 1)
+            if found:
+                return found
+        return None
+    if isinstance(node, list):
+        for value in node:
+            found = _find_music_meta(value, depth + 1)
+            if found:
+                return found
+    return None
+
+
+class Main(star.Star):
+    def __init__(self, context: star.Context, config=None) -> None:
+        super().__init__(context)
+        self.context = context
+        #: **本插件**的配置对象 —— AstrBot 把它作为**第二个参数**注入，对应
+        #: `data/config/<插件名>_config.json`。
+        #: ⚠️ 别改用 `self.context.get_config()`：那是**全局**配置，里面没有本插件的段，
+        #: 于是每次读配置都会**静默**退回代码里的默认值。本项目真踩过 ——
+        #: 配置里写 `send_as: "file"`，实际却按默认的 `record,file` 把语音和文件都发了，
+        #: 而且**一点报错都没有**（症状和"配置没保存"一模一样）。
+        self.config = config or {}
+        #: 上一次响应时间，按 unified_msg_origin 记（简单冷却，不必持久化）
+        self._last_reply: dict[str, float] = {}
+
+    # ---- 主入口 --------------------------------------------------------
+
+    @filter.event_message_type(EventMessageType.ALL)
+    async def on_message(self, event: AstrMessageEvent):
+        """只在「被 @ + 引用了含网易云链接的消息」时动手。
+
+        ⚠️ **中间反馈必须用 `await event.send()`，不能 `yield`。**
+        实测踩过：写成 `async def` + 多次 `yield` 时，AstrBot 在 `stop_event()`
+        之后就不再往下迭代生成器了 —— 于是"收到喵"发出去了，**后面的下载代码一行没跑**
+        （日志里连一条 `[netease]` 都没有）。petpet 那种"stop + 只 yield 一次"才是安全的。
+        所以这里：中间状态用 `await event.send(...)` 主动发，**最后只 yield 一次**（发歌）。
+        """
+        if not self._cfg("enable", True):
+            return
+        if not event.is_at_or_wake_command:
+            return
+
+        reply = next(
+            (seg for seg in (event.message_obj.message or []) if isinstance(seg, Reply)),
+            None,
+        )
+
+        # 链接从哪来：**优先被引用的那条消息**（引用是明确意图），
+        # **没有引用就看本条消息自己** —— 主人 2026-10-06 要的「直接 @ 就行」，
+        # 例如 `@南汐 https://music.163.com/song?id=3413072220&…`。
+        # `event.message_str` 是 AstrBot 摘掉 At 段之后的纯文本，正好拿来提链接。
+        text = ""
+        chain = None
+        where = ""
+        if reply is not None:
+            text = self._reply_text(reply)
+            chain = getattr(reply, "chain", None)
+            where = "引用"
+        if not self._pick_netease_url(text):
+            own = str(getattr(event, "message_str", "") or "")
+            if own:
+                text = own
+                chain = getattr(event.message_obj, "message", None)
+                where = "本条"
+
+        # 诊断用：消息的组件类型随 QQ/适配器版本变，打出来才好对症
+        logger.info(
+            "[netease] 链接来源=%s  组件=%s  文本前 80 字=%r",
+            where or "(无)",
+            [type(s).__name__ for s in (chain or [])],
+            text[:80],
+        )
+        if not text:
+            return
+        url = self._pick_netease_url(text)
+        if not url:
+            return
+        # 卡片里通常带歌名/歌手，挖出来给文件命名用（挖不到就退回歌曲 id）
+        song_label = self._card_song_name(chain)
+
+        async def say(msg: str) -> None:
+            """中间反馈：主动发送，不占用 yield。"""
+            await event.send(MessageChain([Plain(msg)]))
+
+        umo = event.unified_msg_origin
+        now = time.monotonic()
+        last = self._last_reply.get(umo, 0.0)
+        if now - last < COOLDOWN_SECONDS:
+            left = int(COOLDOWN_SECONDS - (now - last))
+            await say(f"喵…刚点过一首，{left} 秒后再来 ｀へ´*")
+            event.stop_event()
+            return
+        self._last_reply[umo] = now
+
+        await say("收到喵，去找这首歌…")
+
+        try:
+            song_id = await self._resolve_song_id(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[netease] 解析链接失败 {url}: {exc}")
+            await say("这个链接我打不开喵(´・ω・`)")
+            event.stop_event()
+            return
+        if not song_id:
+            await say("这个链接里没找着歌曲 id 喵…")
+            event.stop_event()
+            return
+
+        try:
+            path, size = await self._download(song_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[netease] 下载失败 id={song_id}: {exc}")
+            await say(
+                f"这首下不了喵 —— {exc}\n"
+                "（多半是 VIP / 版权受限，官方外链接口只给能免费听的歌）"
+            )
+            event.stop_event()
+            return
+
+        # 文件名优先用卡片里的「歌名 - 歌手」（如 `兄弟难当 - 杜歌.mp3`）；
+        # **直接 @ 的场景本条消息里压根没有卡片**，退一步去问一次歌曲页的 og:title；
+        # 两条都拿不到才是歌曲 id。顺手清掉 Windows / QQ 文件名不接受的字符。
+        if not song_label:
+            song_label = await self._fetch_song_title(song_id)
+        label = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", song_label).strip() or song_id
+        name = f"{label}.mp3"
+        logger.info(f"[netease] id={song_id} 下载完成 {size} 字节 -> {path}  文件名={name}")
+
+        # 发送。**默认两个都发**（语音 + mp3 文件），按配置可只留一个。
+        #
+        # ⚠️ 顺序是**被框架逼出来的，不能换**：
+        #   · 群文件走 `upload_group_file`，是一次普通 `await` —— 必须先做；
+        #   · 语音走 AstrBot 的 `Record` 组件，必须是**最后一次 `yield`** ——
+        #     因为 `yield` 之后框架就不再往下跑这个生成器了（见模块 docstring 坑 5）。
+        #   所以群里看到的顺序固定是「文件在上、语音在下」。
+        #
+        # 两条路的原理差别（都 2026-10-06 实测过）：
+        #   · `Record` —— 适配器对 `Image | Record` 会 `convert_to_base64()`，
+        #     读的是**宿主机**文件，与容器无关。
+        #   · `upload_group_file` —— OneBot 读的是**容器内**路径，所以要先 `docker cp` 进去。
+        # ⚠️ 千万别用 AstrBot 的 `File` 组件：它的 `file` 是个 property，会在
+        #    **AstrBot 本机** `os.path.exists()` 检查，容器内路径在宿主机不存在
+        #    ⇒ 返回空串 ⇒ `retcode=1400 message segment "file" is missing required or usable fields`。
+        want = str(self._cfg("send_as", "record,file") or "record,file").lower()
+        kinds = [k.strip() for k in want.split(",") if k.strip()]
+        errors: list[str] = []
+
+        group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
+        bot = getattr(event, "bot", None)
+
+        if "file" in kinds:
+            try:
+                if bot is None:
+                    raise RuntimeError("这个平台适配器没有 bot 句柄，发不了文件")
+                remote = await self._publish_to_container(path, song_id)
+                if group_id:
+                    await bot.call_action(
+                        "upload_group_file",
+                        group_id=int(group_id),
+                        file=remote,
+                        name=name,
+                    )
+                else:
+                    await bot.call_action(
+                        "upload_private_file",
+                        user_id=int(event.get_sender_id()),
+                        file=remote,
+                        name=name,
+                    )
+                logger.info(f"[netease] 已发出 mp3 文件 id={song_id}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"mp3 文件：{exc}")
+                logger.warning(f"[netease] mp3 文件发送失败：{exc}")
+
+        if "record" in kinds:
+            try:
+                event.stop_event()
+                yield event.chain_result([Record(file=str(path))])
+                logger.info(f"[netease] 已发出语音 id={song_id}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"语音：{exc}")
+                logger.warning(f"[netease] 语音发送失败：{exc}")
+
+        if errors:
+            await say("下是下好了，可发不进群里喵…(´・ω・`)\n" + "\n".join(errors))
+            event.stop_event()
+
+    # ---- 各种小工具 ----------------------------------------------------
+
+    def _cfg(self, key: str, default):
+        """读**本插件**的配置；没配就回默认值（不能因为配置缺失就不干活）。
+
+        Args:
+            key: 配置项名，见 `_conf_schema.json`。
+            default: 没配时的回退值。
+
+        Returns:
+            object: 配置值；没配或读失败则返回 `default`。
+        """
+        try:
+            if hasattr(self.config, "get"):
+                value = self.config.get(key)
+                if value is not None:
+                    return value
+        except Exception:  # noqa: BLE001 - 配置读失败也不能让点歌整个挂掉
+            pass
+        return default
+
+    @staticmethod
+    def _reply_text(reply) -> str:
+        """把被引用消息的文字拼出来（纯文本 + JSON 卡片都吃）。
+
+        ``Reply.text`` 通常直接就是全文（实测如此）；没有的话退回去遍历 ``chain``。
+
+        **卡片式分享也要能认**：QQ 里分享网易云音乐会发一个 ``json`` 段，形如
+        ``{"app":"com.tencent.music.lua","view":"music","meta":{"music":{
+        "title":"兄弟难当","jumpUrl":"https://y.music.163.com/m/song?id=26545127&…"}}}``
+        —— 歌曲 id 就藏在 ``jumpUrl`` / ``musicUrl`` 的 ``id=`` 参数里。
+        ⚠️ **刻意不去逐字段解析卡片**：它的结构随 QQ 版本变（本机实测是
+        ``data.data`` 里再套一层 JSON 字符串，而不是直接给对象）。
+        **整坨序列化成字符串再交给下面那套正则**，格式怎么变都能认出来。
+        """
+        parts: list[str] = []
+        direct = getattr(reply, "text", None)
+        if direct:
+            parts.append(str(direct))
+        for seg in getattr(reply, "chain", None) or []:
+            if isinstance(seg, Plain) and seg.text:
+                parts.append(str(seg.text))
+            elif isinstance(seg, Json):
+                try:
+                    parts.append(json.dumps(seg.data, ensure_ascii=False))
+                except Exception:  # noqa: BLE001 - 卡片再怪也不能让整条消息处理失败
+                    parts.append(str(seg.data))
+            else:
+                for attr in ("text", "name", "url"):
+                    val = getattr(seg, attr, None)
+                    if isinstance(val, str) and val:
+                        parts.append(val)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _card_song_name(chain) -> str:
+        """从消息链的 JSON 卡片里挖「歌名 - 歌手」，挖不到就回空串（只用来命名文件）。
+
+        Args:
+            chain: 消息组件列表 —— 被引用消息的 ``Reply.chain``，或本条消息自己的
+                ``event.message_obj.message``。两者都可能带卡片。
+
+        Returns:
+            str: 形如 ``兄弟难当 - 杜歌``；挖不到就是空串。
+        """
+        for seg in chain or []:
+            if not isinstance(seg, Json):
+                continue
+            try:
+                music = _find_music_meta(seg.data)
+            except Exception:  # noqa: BLE001
+                continue
+            if not music:
+                continue
+            title = str(music.get("title") or "").strip()
+            desc = str(music.get("desc") or "").strip()
+            if title and desc:
+                return f"{title} - {desc}"
+            if title or desc:
+                return title or desc
+        return ""
+
+    async def _fetch_song_title(self, song_id: str) -> str:
+        """最后一道取歌名的退路：读歌曲页的 ``og:title``。
+
+        为什么需要它：**直接 @ 的场景没有卡片**（本条消息只有 At + Plain），
+        于是文件名会退化成一串纯数字 ``3413072220.mp3``，与「引用卡片」那条路
+        （``兄弟难当 - 杜歌.mp3``）口径不一致。歌曲页是服务端渲染的，
+        ``<meta property="og:title">`` 里就是歌名，**不需要登录态**（2026-10-06 实测
+        200 / 135 KB / ``直到大地变成一颗酸橙``）。
+
+        ⚠️ **纯尽力而为**：任何异常都吞掉并回空串 —— 歌**已经下好了**，
+        不能因为"起名字"这一步失败就把整首歌吞掉。所以这里连 ``logger.warning``
+        都不用，INFO 一行足够，免得在日志里看起来像个故障。
+
+        Args:
+            song_id: 歌曲 id。
+
+        Returns:
+            str: 歌名（可能含歌手，取决于页面）；拿不到就是空串。
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"https://music.163.com/song?id={song_id}",
+                    headers={"User-Agent": UA},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    page = await resp.text(errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[netease] 取歌名失败（不影响发送）：{exc}")
+            return ""
+        # 两种属性顺序都试一下（实测本机是 property 在前，但不值得赌）。
+        for pattern in (
+            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']*)["\']',
+            r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+property=["\']og:title["\']',
+        ):
+            m = re.search(pattern, page)
+            if m:
+                return unescape(m.group(1)).strip()
+        return ""
+
+    @staticmethod
+    def _pick_netease_url(text: str) -> str | None:
+        """从一段文本里挑出第一个网易云链接。"""
+        for url in LINK_RE.findall(text):
+            low = url.lower()
+            if any(host in low for host in NETEASE_HOSTS):
+                return url.rstrip(".,;，。；")
+        return None
+
+    async def _resolve_song_id(self, url: str) -> str | None:
+        """拿到歌曲 id：直接链就地提取；短链先跟随重定向。"""
+        m = ID_RE.search(url)
+        if m:
+            return m.group(1)
+        if not any(host in url.lower() for host in SHORT_HOSTS):
+            return None
+        # 短链：只看重定向，不下载页面正文
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={"User-Agent": UA},
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                final = str(resp.url)
+        logger.info(f"[netease] 短链解析：{url} -> {final[:120]}")
+        m = ID_RE.search(final)
+        return m.group(1) if m else None
+
+    async def _download(self, song_id: str) -> tuple[Path, int]:
+        """下载 mp3 并**验证它真是音频**（HTTP 200 不可信，见模块 docstring 坑 2）。
+
+        Returns:
+            tuple: ``(本地路径, 字节数)``。
+
+        Raises:
+            RuntimeError: 拿到的东西不像音频（文案会直接回给群友，所以写人话）。
+        """
+        url = OUTER_URL.format(sid=song_id)
+        out_dir = StarTools.get_data_dir("astrbot_plugin_netease_pick") / "cache"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{song_id}.mp3"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={"User-Agent": UA},
+                timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
+            ) as resp:
+                ctype = str(resp.headers.get("Content-Type") or "")
+                final = str(resp.url)
+                data = await resp.read()
+
+        if not ctype.startswith("audio/"):
+            raise RuntimeError(f"接口没给音频（{ctype or '未知类型'}）")
+        if "music.126.net" not in final:
+            raise RuntimeError("没跳到 CDN，多半是空壳")
+        if len(data) < MIN_AUDIO_BYTES:
+            raise RuntimeError(f"文件太小（{len(data)} 字节）")
+
+        out.write_bytes(data)
+        self._cleanup(out_dir)
+        return out, len(data)
+
+    async def _publish_to_container(self, local: Path, song_id: str) -> str:
+        """把下载好的文件送进 QQ 容器，返回**容器内**路径。
+
+        **只在需要时才 cp。** 两种常见部署的文件系统关系完全不同：
+          · **AstrBot 在宿主机、协议端在容器里**（本项目就是这种）⇒ 两边隔离，
+            把宿主机路径直接交给 OneBot 会报
+            `ActionFailed retcode=100: ENOENT: no such file or directory, realpath 'D:/…'`
+            （2026-10-06 实测踩过，日志里就这一行）⇒ **必须**先 cp 进容器，
+            发**容器内路径**。这时把配置项 `container` 填成协议端的容器名。
+          · **AstrBot 自己也在容器里**（官方 Docker Compose 部署就是这样，容器里
+            **没有 docker CLI**，`docker cp` 根本跑不了），或两边共享了挂载卷
+            ⇒ **跳过这一步**，直接把路径交出去。这时把 `container` **留空**。
+
+        判据很简单：**`container` 配了就 cp，留空就直传。**
+
+        Args:
+            local: 宿主机上的文件路径。
+            song_id: 歌曲 id，用来给容器内文件起名。
+
+        Returns:
+            str: 容器内路径（如 ``/tmp/nanxi-song-3410744228.mp3``）。
+
+        Raises:
+            RuntimeError: `docker cp` 失败（带 stderr 片段）。
+        """
+        container = str(self._cfg("container", "") or "").strip()
+        if not container:
+            # 留空 ⇒ 协议端与 AstrBot 在同一个文件系统上（同机非 Docker、
+            # 或容器间共享了挂载卷）⇒ 直传宿主机路径，跳过 docker cp。
+            logger.info("[netease] 未配置 container，直接把路径交给协议端（跳过 docker cp）")
+            return str(local)
+        remote = f"/tmp/astrbot-netease-{song_id}.mp3"
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "cp",
+            str(local),
+            f"{container}:{remote}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"docker cp 失败({proc.returncode}): "
+                f"{err.decode('utf-8', 'replace')[:200]}"
+            )
+        return remote
+
+    @staticmethod
+    def _cleanup(out_dir: Path, keep_seconds: int = 3600) -> None:
+        """清掉过期缓存，别让目录无限长。"""
+        deadline = time.time() - keep_seconds
+        for f in out_dir.glob("*.mp3"):
+            try:
+                if f.stat().st_mtime < deadline:
+                    f.unlink()
+            except OSError:
+                pass

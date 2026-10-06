@@ -1,0 +1,17 @@
+{
+  "enable": {
+    "description": "启用点歌（@机器人 + 网易云链接，链接可以直接发，也可以引用一条含链接的消息）",
+    "type": "bool",
+    "default": true
+  },
+  "send_as": {
+    "description": "发哪些形式，逗号分隔。record=语音（能在聊天窗直接播放）、file=mp3 文件（可下载留存）。默认两个都发；只想要一个就填 record 或 file。⚠️ 无论怎么填，群里顺序都是「文件在上、语音在下」—— 因为语音必须走最后一次 yield，而 yield 之后框架就不再执行后续代码了。",
+    "type": "string",
+    "default": "record,file"
+  },
+  "container": {
+    "description": "QQ 协议端（NapCat / Lagrange / SnowLuma 等）的 Docker 容器名，仅发 file 时用到。AstrBot 在宿主机、协议端在容器里时两边文件系统隔离，必须先 docker cp 进去再发容器内路径，这时填容器名；AstrBot 自己也在容器里（官方 Docker Compose 部署，容器内没有 docker CLI），或两边共享挂载卷时，**留空**即可直接传路径。",
+    "type": "string",
+    "default": ""
+  }
+}
