@@ -1,0 +1,52 @@
+# 把本仓（个人仓 beichen24a1/astrbot_plugin_netease_pick）单向镜像到
+# 组织 fork（NekoHome-Studio/astrbot_plugin_netease_pick），让插件出现在组织仓库列表里。
+#
+# 设计要点（踩过才知道，别随手改）：
+#   · 工作放在【上游/个人仓】而不是 fork —— `schedule` 事件只在默认分支触发，
+#     而 fork 侧放 workflow 文件会让它的 main 永远无法与上游 ff-only 对齐。
+#   · tag 事件【绝不推 main】—— 否则一个指向旧提交的 tag 会把镜像的 main 拖回旧版本。
+#   · `persist-credentials: false` 必须设：actions/checkout 默认会把 GITHUB_TOKEN 写进
+#     `http.extraheader`，那个 header 会【盖掉】remote URL 里的凭据 ⇒ 403。
+#   · `if: github.repository == ...` 让 fork 侧即使被触发也直接跳过（fork 上没有 secret），
+#     否则上游 workflow 会在 fork 里跟着跑并产生一串失败噪音。
+#   · fork 仓库【不支持 deploy key】（422 Deploy keys are disabled for this repository），
+#     所以凭据只能用 PAT / OAuth token 存进 secret。
+name: mirror-to-org
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-to-org
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'beichen24a1/astrbot_plugin_netease_pick'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 关键：别让 GITHUB_TOKEN 写进 http.extraheader，否则会盖掉 org remote 的凭据 → 403
+          persist-credentials: false
+
+      - name: Mirror main and tags to the org fork
+        env:
+          SYNC_TOKEN: ${{ secrets.ORG_MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global --unset-all "http.https://github.com/.extraheader" || true
+          git remote add org "https://x-access-token:${SYNC_TOKEN}@github.com/NekoHome-Studio/astrbot_plugin_netease_pick.git"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            git push --force org HEAD:refs/heads/main
+          else
+            echo "tag event (${GITHUB_REF}): 只同步 tags，不动 main"
+          fi
+          git push --force org --tags
